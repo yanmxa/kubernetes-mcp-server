@@ -8,6 +8,62 @@
 - **Managed Cluster**: cluster1
 - **Cluster Proxy URL**: cluster-proxy-user.apps.obs-hub-of-hubs-aws-418-sno-c82l2.scale.red-chesterfield.com
 
+## 版本要求
+
+**Note**: MCE (Multicluster Engine) version must be >= 2.9 to use the service-proxy feature.
+
+## 前置条件检查
+
+在开始测试之前，请确保以下条件满足：
+
+### 1. 验证 MCE 版本
+
+```bash
+oc get csv -n multicluster-engine -o json | jq -r '.items[] | select(.metadata.name | contains("multicluster-engine")) | "\(.metadata.name): \(.spec.version)"'
+```
+
+预期输出：版本应 >= 2.9.0
+
+### 2. 检查 cluster-proxy addon 状态
+
+```bash
+# 检查 addon 是否已安装并可用
+oc get managedclusteraddon cluster-proxy -n cluster1 -o yaml
+
+# 预期 status.conditions 中应该有：
+# - type: Available, status: "True"
+# - type: ManifestApplied, status: "True"
+```
+
+### 3. 验证 ManagedClusterSet 配置
+
+**重要**: ManagedProxyServiceResolver 使用特定的 ManagedClusterSet 来选择哪些集群可以通过 service-proxy 访问。
+
+```bash
+# 检查 service-proxy 的 ManagedClusterSet 配置
+oc get managedproxyserviceresolvers.proxy.open-cluster-management.io service-proxy -o yaml
+
+# 查看 spec.managedClusterSelector.managedClusterSet.name 字段
+# 例如: name: global
+```
+
+```bash
+# 验证 managed cluster 是否在正确的 clusterset 中
+oc get managedcluster cluster1 --show-labels | grep clusterset
+
+# 如果 cluster1 不在正确的 clusterset 中，需要更新标签
+# 例如，如果 service-proxy 使用的是 "global" clusterset：
+oc label managedcluster cluster1 cluster.open-cluster-management.io/clusterset=global --overwrite
+```
+
+### 4. 获取 cluster-proxy URL
+
+```bash
+# 动态获取 cluster-proxy user server 的 URL
+CLUSTER_PROXY_URL=$(oc get route cluster-proxy-addon-user -n multicluster-engine -o jsonpath='{.spec.host}')
+echo "Cluster Proxy URL: $CLUSTER_PROXY_URL"
+```
+
 ---
 
 ## 场景 1: 使用 Service Account 访问 Managed Cluster Services
@@ -106,8 +162,8 @@ ManifestWork 内容显示在 cluster1 上创建了：
 # 获取 service account token
 SA_TOKEN=$(oc get secret test-sa-token -n test -o jsonpath='{.data.token}' | base64 -d)
 
-# 设置 cluster-proxy URL
-CLUSTER_PROXY_URL="cluster-proxy-user.apps.obs-hub-of-hubs-aws-418-sno-c82l2.scale.red-chesterfield.com"
+# 动态获取 cluster-proxy URL
+CLUSTER_PROXY_URL=$(oc get route cluster-proxy-addon-user -n multicluster-engine -o jsonpath='{.spec.host}')
 
 # 测试访问 cluster1 上的 services
 curl -k -H "Authorization: Bearer $SA_TOKEN" \
@@ -277,8 +333,8 @@ USER_TOKEN=$(oc whoami -t)
 # 切换回 admin
 oc login -u kube:admin --insecure-skip-tls-verify=true
 
-# 设置 cluster-proxy URL
-CLUSTER_PROXY_URL="cluster-proxy-user.apps.obs-hub-of-hubs-aws-418-sno-c82l2.scale.red-chesterfield.com"
+# 动态获取 cluster-proxy URL
+CLUSTER_PROXY_URL=$(oc get route cluster-proxy-addon-user -n multicluster-engine -o jsonpath='{.spec.host}')
 
 # 测试访问 cluster1 上的 pods
 curl -k -H "Authorization: Bearer $USER_TOKEN" \
@@ -349,7 +405,9 @@ echo "======================================================================"
 echo "Cluster Proxy Service Access Test"
 echo "======================================================================"
 
-CLUSTER_PROXY_URL="cluster-proxy-user.apps.obs-hub-of-hubs-aws-418-sno-c82l2.scale.red-chesterfield.com"
+# 动态获取 cluster-proxy URL
+CLUSTER_PROXY_URL=$(oc get route cluster-proxy-addon-user -n multicluster-engine -o jsonpath='{.spec.host}')
+echo "Cluster Proxy URL: $CLUSTER_PROXY_URL"
 
 # ============================================================================
 # Scenario 1: Service Account -> Services
@@ -500,9 +558,34 @@ echo "======================================================================"
 
 ### 两个场景都返回 401 Unauthorized
 
+**已知问题**: 当前版本（MCE 2.9.0）在使用 Service Account 和 OpenShift User 进行认证时都返回 401 Unauthorized 错误。
+
+错误信息：
+```
+authentication failed: managed cluster auth: not authenticated, hub cluster auth error: Unauthorized
+```
+
 **可能的原因**:
 
-1. **cluster-proxy 配置问题**
+1. **❗ ManagedClusterSet 配置不匹配（最常见）**
+
+   ManagedProxyServiceResolver 通过 `spec.managedClusterSelector.managedClusterSet` 来选择哪些集群可以通过 service-proxy 访问。如果 managed cluster 不在指定的 clusterset 中，将无法访问。
+
+   ```bash
+   # 检查 ManagedProxyServiceResolver 配置
+   oc get managedproxyserviceresolvers.proxy.open-cluster-management.io service-proxy -o yaml
+
+   # 查看使用的 clusterset (例如: global)
+   # spec.managedClusterSelector.managedClusterSet.name
+
+   # 检查 cluster1 当前的 clusterset
+   oc get managedcluster cluster1 --show-labels | grep clusterset
+
+   # 如果不匹配，更新 cluster1 的 clusterset 标签
+   oc label managedcluster cluster1 cluster.open-cluster-management.io/clusterset=global --overwrite
+   ```
+
+2. **cluster-proxy 配置问题**
    ```bash
    # 检查 ManagedProxyServiceResolver 配置
    oc get managedproxyserviceresolvers.proxy.open-cluster-management.io service-proxy -o yaml
@@ -511,7 +594,7 @@ echo "======================================================================"
    oc get managedcluster cluster1 --show-labels
    ```
 
-2. **cluster-proxy-addon 未正确配置或运行**
+3. **cluster-proxy-addon 未正确配置或运行**
    ```bash
    # 检查 addon 状态
    oc get managedclusteraddon cluster-proxy -n cluster1 -o yaml
@@ -523,14 +606,14 @@ echo "======================================================================"
    oc logs -n multicluster-engine <pod-name> -c user-server --tail=100
    ```
 
-3. **身份验证流程问题**
+4. **身份验证流程问题**
    ```bash
    # 使用 verbose 模式查看详细请求信息
    curl -k -v -H "Authorization: Bearer $SA_TOKEN" \
-     "https://$CLUSTER_PROXY_URL/cluster1/api/v1/namespaces/open-cluster-management-agent-addon/services" 2>&1 | head -50
+     "https://$CLUSTER_PROXY_URL/cluster1/api/v1/namespaces/open-cluster-management-agent-addon/services" 2>&1 | head-50
    ```
 
-4. **RBAC 在 cluster1 上未生效**（如果可以直接访问 cluster1）
+5. **RBAC 在 cluster1 上未生效**（如果可以直接访问 cluster1）
    ```bash
    # 切换到 cluster1
    oc config use-context <cluster1-context>
